@@ -64,7 +64,7 @@ def _extract_detail(div: Tag, label: str) -> str:
 
 
 def parse_page(html: str) -> list[EmployeeRecord]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     table = soup.find("table", id="thetable")
     if not table:
         return []
@@ -128,7 +128,7 @@ def parse_page(html: str) -> list[EmployeeRecord]:
 
 def parse_available_months(html: str, year: int) -> list[int]:
     """Retorna lista de meses disponíveis (não disabled) para um dado ano."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     pills = soup.select(".nav-pills li")
     months: list[int] = []
     for li in pills:
@@ -146,7 +146,7 @@ def parse_available_months(html: str, year: int) -> list[int]:
 
 def parse_available_years(html: str) -> list[int]:
     """Retorna lista de anos disponíveis nas tabs."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     tabs = soup.select(".nav-tabs li")
     years: list[int] = []
     for li in tabs:

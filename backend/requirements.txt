@@ -6,3 +6,4 @@ alembic==1.14.0
 sqladmin==0.20.1
 requests==2.32.3
 beautifulsoup4==4.12.3
+lxml==5.3.1
