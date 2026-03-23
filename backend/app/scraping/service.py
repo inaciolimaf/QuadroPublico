@@ -16,7 +16,9 @@ from app.scraping.parser import (
     parse_page,
 )
 
-MAX_WORKERS = 12
+import os
+
+MAX_WORKERS = 4 if os.getenv("ENV") == "production" else 12
 
 
 def _get_or_create_funcionario(db: Session, nome: str, cpf_parcial: str | None) -> Funcionario:
