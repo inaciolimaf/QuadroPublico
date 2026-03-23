@@ -185,76 +185,72 @@ def sync_all(db: Session) -> dict:
             "synced": 0,
         }
 
-    # Busca em paralelo
-    results: list[tuple[int, int, list[EmployeeRecord]]] = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(_fetch_and_parse, y, m): (y, m) for y, m in to_fetch
-        }
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                period = futures[future]
-                print(f"[SYNC] ERRO ao buscar {period[0]}/{period[1]:02d}: {e}")
-
-    # Persiste no banco — sequencial para evitar problemas de sessão
-    # Cache local para evitar SELECT repetidos
+    # Processa 1 período por vez: baixa, parseia, salva, libera memória
+    # Evita acumular dezenas de páginas de 4-8MB na memória
     func_cache: dict[tuple[str, str | None], Funcionario] = {}
     cargo_cache: dict[tuple[int, str], Cargo] = {}
 
     total_records = 0
     total_contracheques = 0
-    for year, month, records in sorted(results):
-        print(f"[DB] Salvando {year}/{month:02d}: {len(records)} registros...")
-        for record in records:
-            # Cache de funcionários
-            func_key = (record.nome, record.cpf_parcial)
-            if func_key not in func_cache:
-                func_cache[func_key] = _get_or_create_funcionario(db, record.nome, record.cpf_parcial)
-            funcionario = func_cache[func_key]
+    synced_periods = 0
+    for i, (year, month) in enumerate(sorted(to_fetch), 1):
+        print(f"[SYNC] [{i}/{len(to_fetch)}] Processando {year}/{month:02d}...")
+        try:
+            html = fetch_page(year, month)
+            raw = parse_page(html)
+            records = _aggregate_records(raw)
+            del html  # libera memória da página
+            print(f"[SYNC] [{i}/{len(to_fetch)}] {year}/{month:02d}: {len(raw)} linhas -> {len(records)} registros")
 
-            # Cache de cargos
-            cargo_key = (funcionario.id, record.matricula)
-            if cargo_key not in cargo_cache:
-                cargo_cache[cargo_key] = _get_or_create_cargo(db, funcionario, record)
-            else:
-                # Atualiza campos mutáveis mesmo com cache
-                _get_or_create_cargo(db, funcionario, record)
-            cargo_obj = cargo_cache[cargo_key]
+            for record in records:
+                func_key = (record.nome, record.cpf_parcial)
+                if func_key not in func_cache:
+                    func_cache[func_key] = _get_or_create_funcionario(db, record.nome, record.cpf_parcial)
+                funcionario = func_cache[func_key]
 
-            existing_cc = _get_contracheque(db, cargo_obj.id, month, year)
-            if existing_cc:
-                # Atualiza valores se mudaram (relevante para 13º que pode ser atualizado)
-                if (existing_cc.provento != record.provento
-                        or existing_cc.desconto != record.desconto
-                        or existing_cc.liquido != record.liquido):
-                    existing_cc.provento = record.provento
-                    existing_cc.desconto = record.desconto
-                    existing_cc.liquido = record.liquido
+                cargo_key = (funcionario.id, record.matricula)
+                if cargo_key not in cargo_cache:
+                    cargo_cache[cargo_key] = _get_or_create_cargo(db, funcionario, record)
+                else:
+                    _get_or_create_cargo(db, funcionario, record)
+                cargo_obj = cargo_cache[cargo_key]
+
+                existing_cc = _get_contracheque(db, cargo_obj.id, month, year)
+                if existing_cc:
+                    if (existing_cc.provento != record.provento
+                            or existing_cc.desconto != record.desconto
+                            or existing_cc.liquido != record.liquido):
+                        existing_cc.provento = record.provento
+                        existing_cc.desconto = record.desconto
+                        existing_cc.liquido = record.liquido
+                        total_contracheques += 1
+                else:
+                    contracheque = Contracheque(
+                        cargo_id=cargo_obj.id,
+                        provento=record.provento,
+                        desconto=record.desconto,
+                        liquido=record.liquido,
+                        referencia_mes=month,
+                        referencia_ano=year,
+                    )
+                    db.add(contracheque)
                     total_contracheques += 1
-            else:
-                contracheque = Contracheque(
-                    cargo_id=cargo_obj.id,
-                    provento=record.provento,
-                    desconto=record.desconto,
-                    liquido=record.liquido,
-                    referencia_mes=month,
-                    referencia_ano=year,
-                )
-                db.add(contracheque)
-                total_contracheques += 1
 
-            total_records += 1
+                total_records += 1
 
-        db.commit()
-        print(f"[DB] {year}/{month:02d} salvo com sucesso!")
+            db.commit()
+            synced_periods += 1
+            print(f"[SYNC] [{i}/{len(to_fetch)}] {year}/{month:02d} salvo!")
+
+        except Exception as e:
+            print(f"[SYNC] ERRO em {year}/{month:02d}: {e}")
+            db.rollback()
 
     print(f"[SYNC] Concluído! {total_contracheques} contracheques novos de {total_records} registros processados")
     return {
         "status": "synced",
         "total_periods": len(all_periods),
-        "synced_periods": len(results),
+        "synced_periods": synced_periods,
         "total_records_processed": total_records,
         "new_contracheques": total_contracheques,
     }
