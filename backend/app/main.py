@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -10,9 +11,17 @@ from app.funcionarios.router import router as funcionarios_router
 from app.cargos.router import router as cargos_router
 from app.contracheques.router import router as contracheques_router
 from app.scraping.router import router as scraping_router
+from app.scraping.scheduler import start_auto_sync
 from app.admin import setup_admin
 
-app = FastAPI(title="QuadroPublico API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_auto_sync()
+    yield
+
+
+app = FastAPI(title="QuadroPublico API", lifespan=lifespan)
 setup_admin(app)
 
 app.add_middleware(

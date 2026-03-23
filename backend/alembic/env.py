@@ -13,9 +13,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Permite override da URL via env var (usado no Docker)
+# Permite override da URL via env var (usado no Docker/Fly)
 database_url = os.getenv("DATABASE_URL")
 if database_url:
+    # Fly.io seta postgres:// mas SQLAlchemy precisa de postgresql://
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
     config.set_main_option("sqlalchemy.url", database_url)
 
 target_metadata = Base.metadata
