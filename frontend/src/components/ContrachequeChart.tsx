@@ -43,7 +43,7 @@ export function ContrachequeChart({ contracheques }: Props) {
             }
           />
           <Tooltip
-            formatter={(value: number) => formatBRL(value)}
+            formatter={(value) => formatBRL(Number(value))}
             labelStyle={{ fontWeight: 600 }}
           />
           <Legend />

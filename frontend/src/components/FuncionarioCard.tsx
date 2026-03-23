@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { ChevronDown, User, Building2, Briefcase } from "lucide-react"
-import type { Cargo, Contracheque, Funcionario } from "@/types"
+import type { Contracheque, Funcionario } from "@/types"
 import { useFuncionarioDetail } from "@/hooks/useFuncionarioDetail"
 import { listContracheques } from "@/services/contracheques"
 import { CargoItem } from "./CargoItem"
@@ -39,14 +39,6 @@ export function FuncionarioCard({ funcionario }: Props) {
   }, [detail])
 
   const latestCargo = detail?.cargos?.[0] ?? null
-
-  // Último contracheque do cargo mais recente (para preview)
-  const getLastCc = (cargo: Cargo): Contracheque | null => {
-    const ccs = contrachequesByCargo[cargo.id]
-    return ccs?.length ? ccs[ccs.length - 1] : null
-  }
-
-  const latestCc = latestCargo ? getLastCc(latestCargo) : null
 
   return (
     <div className="rounded-xl border border-zinc-200 bg-white shadow-sm overflow-hidden transition-shadow hover:shadow-md">
