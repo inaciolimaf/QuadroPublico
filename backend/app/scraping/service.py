@@ -114,7 +114,15 @@ def _preload_cargo_cache(db: Session) -> dict[tuple[int, str], int]:
     return cache
 
 
+BATCH_SIZE = 200  # Rows por INSERT (evita estourar memória do Postgres)
+
+
 # ---------- Batch operations ----------
+
+def _chunked(lst: list, size: int):
+    """Divide lista em chunks de tamanho fixo."""
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
 
 def _batch_insert_new_funcionarios(
     db: Session,
@@ -131,12 +139,10 @@ def _batch_insert_new_funcionarios(
     if not new_funcs:
         return
 
-    # INSERT simples (sem ON CONFLICT — sabemos que são novos pelo cache)
+    # INSERT simples em chunks (sem ON CONFLICT — sabemos que são novos pelo cache)
     values = list(new_funcs.values())
-    db.execute(
-        Funcionario.__table__.insert(),
-        values,
-    )
+    for chunk in _chunked(values, BATCH_SIZE):
+        db.execute(Funcionario.__table__.insert(), chunk)
 
     # SELECT os recém-inseridos para pegar IDs
     names = list({v["nome"] for v in values})
@@ -175,23 +181,24 @@ def _batch_upsert_cargos(
     if not unique:
         return
 
-    # Multi-row UPSERT (1 roundtrip)
+    # Multi-row UPSERT em chunks
     values = list(unique.values())
-    stmt = pg_insert(Cargo.__table__).values(values)
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_cargo_func_matricula",
-        set_={
-            "orgao": stmt.excluded.orgao,
-            "setor": stmt.excluded.setor,
-            "cargo": stmt.excluded.cargo,
-            "cargo2": stmt.excluded.cargo2,
-            "data_admissao": text("COALESCE(EXCLUDED.data_admissao, cargos.data_admissao)"),
-            "vinculo": text("COALESCE(EXCLUDED.vinculo, cargos.vinculo)"),
-            "carga_horaria_semanal": text("COALESCE(EXCLUDED.carga_horaria_semanal, cargos.carga_horaria_semanal)"),
-            "atualizado_em": text("NOW()"),
-        },
-    )
-    db.execute(stmt)
+    for chunk in _chunked(values, BATCH_SIZE):
+        stmt = pg_insert(Cargo.__table__).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_cargo_func_matricula",
+            set_={
+                "orgao": stmt.excluded.orgao,
+                "setor": stmt.excluded.setor,
+                "cargo": stmt.excluded.cargo,
+                "cargo2": stmt.excluded.cargo2,
+                "data_admissao": text("COALESCE(EXCLUDED.data_admissao, cargos.data_admissao)"),
+                "vinculo": text("COALESCE(EXCLUDED.vinculo, cargos.vinculo)"),
+                "carga_horaria_semanal": text("COALESCE(EXCLUDED.carga_horaria_semanal, cargos.carga_horaria_semanal)"),
+                "atualizado_em": text("NOW()"),
+            },
+        )
+        db.execute(stmt)
 
     # Busca IDs dos que não estão no cache
     missing_func_ids = list({fid for (fid, mat) in unique if (fid, mat) not in cargo_cache})
@@ -236,16 +243,17 @@ def _save_period_bulk(
             "referencia_ano": year,
         })
 
-    stmt = pg_insert(Contracheque.__table__).values(cc_values)
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_contracheque_cargo_ref",
-        set_={
-            "provento": stmt.excluded.provento,
-            "desconto": stmt.excluded.desconto,
-            "liquido": stmt.excluded.liquido,
-        },
-    )
-    db.execute(stmt)
+    for chunk in _chunked(cc_values, BATCH_SIZE):
+        stmt = pg_insert(Contracheque.__table__).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_contracheque_cargo_ref",
+            set_={
+                "provento": stmt.excluded.provento,
+                "desconto": stmt.excluded.desconto,
+                "liquido": stmt.excluded.liquido,
+            },
+        )
+        db.execute(stmt)
 
     db.commit()
     return len(records), len(cc_values)

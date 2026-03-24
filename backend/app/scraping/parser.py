@@ -143,36 +143,31 @@ def parse_page(html: str) -> list[EmployeeRecord]:
 
 def parse_available_months(html: str, year: int) -> list[int]:
     """Retorna lista de meses disponíveis (não disabled) para um dado ano."""
-    nav_start = html.find("nav-pills")
-    if nav_start == -1:
-        return []
-    nav_end = html.find("</ul>", nav_start)
-    if nav_end == -1:
-        return []
-    nav_html = html[nav_start:nav_end]
-
     months: list[int] = []
-    for li_match in re.finditer(r"<li[^>]*>(.*?)</li>", nav_html, re.DOTALL):
-        li_html = li_match.group(0)
-        if "disabled" in li_html:
+    # Busca todos os <li> da página que contêm links pro ano solicitado
+    for li_match in re.finditer(r"(<li[^>]*>)(.*?)</li>", html, re.DOTALL):
+        li_tag = li_match.group(1)  # Só a tag de abertura <li ...>
+        if "disabled" in li_tag:
             continue
-        href_match = re.search(rf'href="[^"]*?{year}(\d{{2}})"', li_html)
+        li_body = li_match.group(2)
+        href_match = re.search(rf'href="[^"]*/{year}(\d{{2}})"', li_body)
         if href_match:
-            months.append(int(href_match.group(1)))
+            month = int(href_match.group(1))
+            if month not in months:
+                months.append(month)
     return months
 
 
 def parse_available_years(html: str) -> list[int]:
     """Retorna lista de anos disponíveis nas tabs."""
-    nav_start = html.find("nav-tabs")
-    if nav_start == -1:
-        return []
-    nav_end = html.find("</ul>", nav_start)
-    if nav_end == -1:
-        return []
-    nav_html = html[nav_start:nav_end]
-
     years: set[int] = set()
-    for m in re.finditer(r'href="[^"]*?/(\d{4})\d{2}"', nav_html):
-        years.add(int(m.group(1)))
+    # Busca todos os links com padrão /YYYYMM no href
+    for m in re.finditer(r'class="nav-tabs".*?</ul>', html, re.DOTALL):
+        for href in re.finditer(r'href="[^"]*?/(\d{4})\d{2}"', m.group()):
+            years.add(int(href.group(1)))
+    if not years:
+        # Fallback: busca no HTML inteiro
+        for m in re.finditer(r'nav-tabs.*?</ul>', html, re.DOTALL):
+            for href in re.finditer(r'href="[^"]*?/(\d{4})\d{2}"', m.group()):
+                years.add(int(href.group(1)))
     return sorted(years)
