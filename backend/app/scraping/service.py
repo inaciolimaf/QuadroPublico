@@ -202,7 +202,7 @@ def _batch_ensure_cargos(
     values_clauses = []
     params = {}
     for i, (fid, mat) in enumerate(missing):
-        values_clauses.append(f"(:f{i}::int, :m{i})")
+        values_clauses.append(f"(CAST(:f{i} AS int), :m{i})")
         params[f"f{i}"] = fid
         params[f"m{i}"] = mat
 
@@ -365,6 +365,9 @@ def sync_all(db: Session) -> dict:
         except Exception as e:
             print(f"[SYNC] ERRO ao salvar {year}/{month:02d}: {e}")
             db.rollback()
+            # Limpa caches — IDs podem ser de transação que foi revertida
+            func_id_cache.clear()
+            cargo_id_cache.clear()
             errors += 1
 
     producer_thread.join()
