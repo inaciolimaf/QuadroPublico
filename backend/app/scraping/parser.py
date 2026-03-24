@@ -3,8 +3,6 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
-from bs4 import BeautifulSoup, Tag
-
 
 @dataclass
 class EmployeeRecord:
@@ -30,7 +28,6 @@ def parse_currency(value: str) -> Decimal:
 
 
 def parse_date_br(value: str) -> date | None:
-    """'01/01/1982' -> date(1982, 1, 1)"""
     value = value.strip()
     if not value:
         return None
@@ -49,61 +46,79 @@ def parse_int_safe(value: str) -> int | None:
         return None
 
 
-def _extract_detail(div: Tag, label: str) -> str:
-    """Extrai valor de um campo do bloco 'Dados pessoais'."""
-    strong = div.find("strong", string=re.compile(label, re.IGNORECASE))
-    if not strong:
-        return ""
-    # O texto vem depois do <br> como text node solto
-    parent = strong.parent
-    if parent is None:
-        return ""
-    texts = list(parent.stripped_strings)
-    # texts = ['CPF', '223.XXX.XXX-87'] ou ['Carga horária semanal', '40']
-    return texts[1] if len(texts) > 1 else ""
+# ---------- Regex patterns (compilados uma vez) ----------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
+
+# Detalhes do bloco hidden
+_CPF_RE = re.compile(
+    r"<strong>[^<]*CPF[^<]*</strong>\s*(?:<br\s*/?>)?\s*([^<]+)", re.IGNORECASE
+)
+_DATA_ADM_RE = re.compile(
+    r"<strong>[^<]*Data de admiss[^<]*</strong>\s*(?:<br\s*/?>)?\s*([^<]+)", re.IGNORECASE
+)
+_VINCULO_RE = re.compile(
+    r"<strong>[^<]*nculo[^<]*</strong>\s*(?:<br\s*/?>)?\s*([^<]+)", re.IGNORECASE
+)
+_CARGA_RE = re.compile(
+    r"<strong>[^<]*Carga hor[^<]*</strong>\s*(?:<br\s*/?>)?\s*([^<]+)", re.IGNORECASE
+)
+
+# Row pattern: <tr> que contém details-control
+_TR_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL)
+
+
+def _strip_tags(s: str) -> str:
+    return _TAG_RE.sub("", s).strip()
+
+
+def _extract_detail(html: str, pattern: re.Pattern) -> str:
+    m = pattern.search(html)
+    return m.group(1).strip() if m else ""
 
 
 def parse_page(html: str) -> list[EmployeeRecord]:
-    soup = BeautifulSoup(html, "lxml")
-    table = soup.find("table", id="thetable")
-    if not table:
+    # Localiza a tabela por string search (evita parsear o HTML inteiro)
+    table_start = html.find('id="thetable"')
+    if table_start == -1:
         return []
+    # Vai para o início do <table
+    table_start = html.rfind("<table", 0, table_start)
+    table_end = html.find("</table>", table_start)
+    if table_end == -1:
+        return []
+    table_html = html[table_start:table_end]
 
     records: list[EmployeeRecord] = []
 
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if not tds:
+    for tr_match in _TR_RE.finditer(table_html):
+        tr_content = tr_match.group(1)
+
+        if "details-control" not in tr_content:
             continue
 
-        # Primeira <td> tem class details-control e contém o bloco de dados pessoais
-        detail_td = tds[0]
-        if "details-control" not in detail_td.get("class", []):
-            continue
-
-        # Extrair dados pessoais do div escondido
-        hidden_div = detail_td.find("div", class_="hide")
-        cpf = _extract_detail(hidden_div, "CPF") if hidden_div else ""
-        data_adm_str = _extract_detail(hidden_div, "Data de admiss") if hidden_div else ""
-        vinculo = _extract_detail(hidden_div, "nculo") if hidden_div else ""
-        carga_str = _extract_detail(hidden_div, "Carga hor") if hidden_div else ""
-
-        # Extrair colunas da tabela
-        # tds[0]=details, tds[1]=matricula, tds[2]=nome, tds[3]=orgao,
-        # tds[4]=setor, tds[5]=cargo, tds[6]=cargo2,
-        # tds[-3]=provento, tds[-2]=desconto, tds[-1]=liquido
+        tds = _TD_RE.findall(tr_content)
         if len(tds) < 8:
             continue
 
-        matricula = tds[1].get_text(strip=True)
-        nome = tds[2].get_text(strip=True)
-        orgao = tds[3].get_text(strip=True) or None
-        setor = tds[4].get_text(strip=True) or None
-        cargo = tds[5].get_text(strip=True) or None
-        cargo2 = tds[6].get_text(strip=True) or None
-        provento = parse_currency(tds[-3].get_text(strip=True))
-        desconto = parse_currency(tds[-2].get_text(strip=True))
-        liquido = parse_currency(tds[-1].get_text(strip=True))
+        # Primeiro TD: bloco de detalhes (CPF, data admissão, etc.)
+        detail_html = tds[0]
+        cpf = _extract_detail(detail_html, _CPF_RE)
+        data_adm_str = _extract_detail(detail_html, _DATA_ADM_RE)
+        vinculo = _extract_detail(detail_html, _VINCULO_RE)
+        carga_str = _extract_detail(detail_html, _CARGA_RE)
+
+        # Demais TDs: texto simples
+        matricula = _strip_tags(tds[1])
+        nome = _strip_tags(tds[2])
+        orgao = _strip_tags(tds[3]) or None
+        setor = _strip_tags(tds[4]) or None
+        cargo = _strip_tags(tds[5]) or None
+        cargo2 = _strip_tags(tds[6]) or None
+        provento = parse_currency(_strip_tags(tds[-3]))
+        desconto = parse_currency(_strip_tags(tds[-2]))
+        liquido = parse_currency(_strip_tags(tds[-1]))
 
         records.append(
             EmployeeRecord(
@@ -128,32 +143,36 @@ def parse_page(html: str) -> list[EmployeeRecord]:
 
 def parse_available_months(html: str, year: int) -> list[int]:
     """Retorna lista de meses disponíveis (não disabled) para um dado ano."""
-    soup = BeautifulSoup(html, "lxml")
-    pills = soup.select(".nav-pills li")
+    nav_start = html.find("nav-pills")
+    if nav_start == -1:
+        return []
+    nav_end = html.find("</ul>", nav_start)
+    if nav_end == -1:
+        return []
+    nav_html = html[nav_start:nav_end]
+
     months: list[int] = []
-    for li in pills:
-        if "disabled" in li.get("class", []):
+    for li_match in re.finditer(r"<li[^>]*>(.*?)</li>", nav_html, re.DOTALL):
+        li_html = li_match.group(0)
+        if "disabled" in li_html:
             continue
-        a = li.find("a")
-        if not a or not a.get("href"):
-            continue
-        href = a["href"]
-        match = re.search(rf"{year}(\d{{2}})$", href)
-        if match:
-            months.append(int(match.group(1)))
+        href_match = re.search(rf'href="[^"]*?{year}(\d{{2}})"', li_html)
+        if href_match:
+            months.append(int(href_match.group(1)))
     return months
 
 
 def parse_available_years(html: str) -> list[int]:
     """Retorna lista de anos disponíveis nas tabs."""
-    soup = BeautifulSoup(html, "lxml")
-    tabs = soup.select(".nav-tabs li")
-    years: list[int] = []
-    for li in tabs:
-        a = li.find("a")
-        if not a or not a.get("href"):
-            continue
-        match = re.search(r"/(\d{4})\d{2}$", a["href"])
-        if match:
-            years.append(int(match.group(1)))
-    return sorted(set(years))
+    nav_start = html.find("nav-tabs")
+    if nav_start == -1:
+        return []
+    nav_end = html.find("</ul>", nav_start)
+    if nav_end == -1:
+        return []
+    nav_html = html[nav_start:nav_end]
+
+    years: set[int] = set()
+    for m in re.finditer(r'href="[^"]*?/(\d{4})\d{2}"', nav_html):
+        years.add(int(m.group(1)))
+    return sorted(years)
