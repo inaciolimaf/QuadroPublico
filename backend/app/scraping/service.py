@@ -1,12 +1,14 @@
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from queue import Queue, Empty
+from queue import Queue
 
+from sqlalchemy import text
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Cargo, Contracheque, Funcionario, SyncLog
+from app.models import Contracheque, SyncLog
 from app.scraping.fetcher import fetch_page
 from app.scraping.parser import (
     EmployeeRecord,
@@ -15,67 +17,9 @@ from app.scraping.parser import (
     parse_page,
 )
 
-SPECIAL_MONTHS_THRESHOLD = 13  # 13º, adiantamento 13º, etc.
+SPECIAL_MONTHS_THRESHOLD = 13
 MAX_WORKERS = 4 if os.getenv("ENV") == "production" else 12
-# Quantas páginas manter pré-buscadas em memória (limita uso de RAM)
 PREFETCH_BUFFER = 3
-
-
-def _get_or_create_funcionario(db: Session, nome: str, cpf_parcial: str | None) -> Funcionario:
-    stmt = select(Funcionario).where(
-        Funcionario.nome == nome,
-        Funcionario.cpf_parcial == cpf_parcial,
-    )
-    func = db.scalars(stmt).first()
-    if func:
-        return func
-    func = Funcionario(nome=nome, cpf_parcial=cpf_parcial)
-    db.add(func)
-    db.flush()
-    return func
-
-
-def _get_or_create_cargo(db: Session, funcionario: Funcionario, record: EmployeeRecord) -> Cargo:
-    stmt = select(Cargo).where(
-        Cargo.funcionario_id == funcionario.id,
-        Cargo.matricula == record.matricula,
-    )
-    cargo = db.scalars(stmt).first()
-    if cargo:
-        cargo.orgao = record.orgao
-        cargo.setor = record.setor
-        cargo.cargo = record.cargo
-        cargo.cargo2 = record.cargo2
-        if record.data_admissao:
-            cargo.data_admissao = record.data_admissao
-        if record.vinculo:
-            cargo.vinculo = record.vinculo
-        if record.carga_horaria_semanal:
-            cargo.carga_horaria_semanal = record.carga_horaria_semanal
-        return cargo
-    cargo = Cargo(
-        funcionario_id=funcionario.id,
-        matricula=record.matricula,
-        orgao=record.orgao,
-        setor=record.setor,
-        cargo=record.cargo,
-        cargo2=record.cargo2,
-        data_admissao=record.data_admissao,
-        vinculo=record.vinculo,
-        carga_horaria_semanal=record.carga_horaria_semanal,
-    )
-    db.add(cargo)
-    db.flush()
-    return cargo
-
-
-def _get_contracheque(db: Session, cargo_id: int, mes: int, ano: int) -> Contracheque | None:
-    stmt = select(Contracheque).where(
-        Contracheque.cargo_id == cargo_id,
-        Contracheque.referencia_mes == mes,
-        Contracheque.referencia_ano == ano,
-    )
-    return db.scalars(stmt).first()
 
 
 def _get_existing_months(db: Session) -> set[tuple[int, int]]:
@@ -148,63 +92,146 @@ def _discover_available_periods() -> list[tuple[int, int]]:
     return all_periods
 
 
-def _save_period(
+# ---------- Raw SQL lookups (sem ORM, sem session bloat) ----------
+
+_SQL_FIND_FUNC = text("""
+    SELECT id FROM funcionarios
+    WHERE nome = :nome AND cpf_parcial IS NOT DISTINCT FROM :cpf_parcial
+""")
+
+_SQL_INSERT_FUNC = text("""
+    INSERT INTO funcionarios (nome, cpf_parcial)
+    VALUES (:nome, :cpf_parcial)
+    RETURNING id
+""")
+
+_SQL_FIND_CARGO = text("""
+    SELECT id FROM cargos
+    WHERE funcionario_id = :funcionario_id AND matricula = :matricula
+""")
+
+_SQL_INSERT_CARGO = text("""
+    INSERT INTO cargos (funcionario_id, matricula, orgao, setor, cargo, cargo2,
+                        data_admissao, vinculo, carga_horaria_semanal)
+    VALUES (:funcionario_id, :matricula, :orgao, :setor, :cargo, :cargo2,
+            :data_admissao, :vinculo, :carga_horaria_semanal)
+    RETURNING id
+""")
+
+_SQL_UPDATE_CARGO = text("""
+    UPDATE cargos SET orgao = :orgao, setor = :setor, cargo = :cargo, cargo2 = :cargo2,
+        data_admissao = COALESCE(:data_admissao, data_admissao),
+        vinculo = COALESCE(:vinculo, vinculo),
+        carga_horaria_semanal = COALESCE(:carga_horaria_semanal, carga_horaria_semanal),
+        atualizado_em = NOW()
+    WHERE id = :id
+""")
+
+_SQL_UPSERT_CONTRACHEQUES = text("""
+    INSERT INTO contracheques (cargo_id, provento, desconto, liquido, referencia_mes, referencia_ano)
+    VALUES (:cargo_id, :provento, :desconto, :liquido, :referencia_mes, :referencia_ano)
+    ON CONFLICT ON CONSTRAINT uq_contracheque_cargo_ref
+    DO UPDATE SET provento = EXCLUDED.provento,
+                  desconto = EXCLUDED.desconto,
+                  liquido = EXCLUDED.liquido
+    WHERE contracheques.provento != EXCLUDED.provento
+       OR contracheques.desconto != EXCLUDED.desconto
+       OR contracheques.liquido != EXCLUDED.liquido
+""")
+
+
+def _resolve_func_id(
+    db: Session,
+    nome: str,
+    cpf_parcial: str | None,
+    cache: dict[tuple[str, str | None], int],
+) -> int:
+    """Retorna o ID do funcionário, criando se necessário. Usa cache."""
+    key = (nome, cpf_parcial)
+    if key in cache:
+        return cache[key]
+    row = db.execute(_SQL_FIND_FUNC, {"nome": nome, "cpf_parcial": cpf_parcial}).first()
+    if row:
+        cache[key] = row[0]
+        return row[0]
+    row = db.execute(_SQL_INSERT_FUNC, {"nome": nome, "cpf_parcial": cpf_parcial}).first()
+    cache[key] = row[0]
+    return row[0]
+
+
+def _resolve_cargo_id(
+    db: Session,
+    func_id: int,
+    record: EmployeeRecord,
+    cache: dict[tuple[int, str], int],
+) -> int:
+    """Retorna o ID do cargo, criando/atualizando se necessário. Usa cache."""
+    key = (func_id, record.matricula)
+    params = {
+        "orgao": record.orgao,
+        "setor": record.setor,
+        "cargo": record.cargo,
+        "cargo2": record.cargo2,
+        "data_admissao": record.data_admissao,
+        "vinculo": record.vinculo,
+        "carga_horaria_semanal": record.carga_horaria_semanal,
+    }
+    if key in cache:
+        db.execute(_SQL_UPDATE_CARGO, {"id": cache[key], **params})
+        return cache[key]
+    row = db.execute(_SQL_FIND_CARGO, {"funcionario_id": func_id, "matricula": record.matricula}).first()
+    if row:
+        cache[key] = row[0]
+        db.execute(_SQL_UPDATE_CARGO, {"id": row[0], **params})
+        return row[0]
+    row = db.execute(_SQL_INSERT_CARGO, {
+        "funcionario_id": func_id,
+        "matricula": record.matricula,
+        **params,
+    }).first()
+    cache[key] = row[0]
+    return row[0]
+
+
+def _save_period_bulk(
     db: Session,
     year: int,
     month: int,
     records: list[EmployeeRecord],
-    func_cache: dict[tuple[str, str | None], Funcionario],
-    cargo_cache: dict[tuple[int, str], Cargo],
+    func_id_cache: dict[tuple[str, str | None], int],
+    cargo_id_cache: dict[tuple[int, str], int],
 ) -> tuple[int, int]:
-    """Salva registros de um período no banco. Retorna (records_count, contracheques_count)."""
-    total_records = 0
-    total_contracheques = 0
+    """Salva registros de um período. Raw SQL + batch upsert de contracheques."""
+    if not records:
+        return 0, 0
 
-    for record in records:
-        func_key = (record.nome, record.cpf_parcial)
-        if func_key not in func_cache:
-            func_cache[func_key] = _get_or_create_funcionario(db, record.nome, record.cpf_parcial)
-        funcionario = func_cache[func_key]
+    # 1) Resolve IDs de funcionários e cargos (com cache, raw SQL)
+    cc_params = []
+    for r in records:
+        func_id = _resolve_func_id(db, r.nome, r.cpf_parcial, func_id_cache)
+        _resolve_cargo_id(db, func_id, r, cargo_id_cache)
+        cargo_id = cargo_id_cache[(func_id, r.matricula)]
+        cc_params.append({
+            "cargo_id": cargo_id,
+            "provento": float(r.provento),
+            "desconto": float(r.desconto),
+            "liquido": float(r.liquido),
+            "referencia_mes": month,
+            "referencia_ano": year,
+        })
 
-        cargo_key = (funcionario.id, record.matricula)
-        if cargo_key not in cargo_cache:
-            cargo_cache[cargo_key] = _get_or_create_cargo(db, funcionario, record)
-        else:
-            _get_or_create_cargo(db, funcionario, record)
-        cargo_obj = cargo_cache[cargo_key]
-
-        existing_cc = _get_contracheque(db, cargo_obj.id, month, year)
-        if existing_cc:
-            if (existing_cc.provento != record.provento
-                    or existing_cc.desconto != record.desconto
-                    or existing_cc.liquido != record.liquido):
-                existing_cc.provento = record.provento
-                existing_cc.desconto = record.desconto
-                existing_cc.liquido = record.liquido
-                total_contracheques += 1
-        else:
-            contracheque = Contracheque(
-                cargo_id=cargo_obj.id,
-                provento=record.provento,
-                desconto=record.desconto,
-                liquido=record.liquido,
-                referencia_mes=month,
-                referencia_ano=year,
-            )
-            db.add(contracheque)
-            total_contracheques += 1
-
-        total_records += 1
+    # 2) Batch upsert de contracheques (1 roundtrip executemany)
+    if cc_params:
+        db.execute(_SQL_UPSERT_CONTRACHEQUES, cc_params)
 
     db.commit()
-    return total_records, total_contracheques
+    return len(records), len(cc_params)
 
 
 def sync_all(db: Session) -> dict:
     """Sincroniza todos os dados do portal com o banco.
 
-    Usa pipeline produtor/consumidor: threads buscam páginas em paralelo
-    enquanto a thread principal salva no banco sequencialmente.
+    Pipeline produtor/consumidor + bulk upsert.
     """
     inicio = datetime.now(timezone.utc)
 
@@ -228,7 +255,6 @@ def sync_all(db: Session) -> dict:
 
     if not to_fetch:
         print("[SYNC] Banco já está atualizado!")
-        # Registra sync completo mesmo sem trabalho
         log = SyncLog(
             iniciado_em=inicio,
             sucesso=True,
@@ -245,20 +271,18 @@ def sync_all(db: Session) -> dict:
 
     to_fetch_sorted = sorted(to_fetch)
 
-    # --- Pipeline: fetch em paralelo, save sequencial ---
-    func_cache: dict[tuple[str, str | None], Funcionario] = {}
-    cargo_cache: dict[tuple[int, str], Cargo] = {}
+    # Caches de IDs (não objetos ORM)
+    func_id_cache: dict[tuple[str, str | None], int] = {}
+    cargo_id_cache: dict[tuple[int, str], int] = {}
 
     total_records = 0
     total_contracheques = 0
     synced_periods = 0
     errors = 0
 
-    # Queue com tamanho limitado para não acumular muitas páginas em memória
     result_queue: Queue[tuple[int, int, list[EmployeeRecord]] | None] = Queue(maxsize=PREFETCH_BUFFER)
 
     def _producer():
-        """Busca páginas em paralelo e coloca na queue."""
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
                 executor.submit(_fetch_and_parse, y, m): (y, m)
@@ -268,18 +292,15 @@ def sync_all(db: Session) -> dict:
                 y, m = futures[future]
                 try:
                     result = future.result()
-                    result_queue.put(result)  # Bloqueia se queue cheia (backpressure)
+                    result_queue.put(result)
                 except Exception as e:
                     print(f"[SYNC] ERRO ao buscar {y}/{m:02d}: {e}")
-                    result_queue.put(None)  # Sinaliza erro
-        # Sentinela de fim
+                    result_queue.put(None)
         result_queue.put("DONE")
 
-    import threading
     producer_thread = threading.Thread(target=_producer, daemon=True)
     producer_thread.start()
 
-    # Consumidor: salva no banco sequencialmente
     processed = 0
     total_to_process = len(to_fetch_sorted)
     while True:
@@ -295,7 +316,9 @@ def sync_all(db: Session) -> dict:
         processed += 1
         print(f"[SYNC] [{processed}/{total_to_process}] Salvando {year}/{month:02d} ({len(records)} registros)...")
         try:
-            rec_count, cc_count = _save_period(db, year, month, records, func_cache, cargo_cache)
+            rec_count, cc_count = _save_period_bulk(
+                db, year, month, records, func_id_cache, cargo_id_cache
+            )
             total_records += rec_count
             total_contracheques += cc_count
             synced_periods += 1
@@ -307,7 +330,6 @@ def sync_all(db: Session) -> dict:
 
     producer_thread.join()
 
-    # Registra sync completo
     sucesso = errors == 0
     log = SyncLog(
         iniciado_em=inicio,
