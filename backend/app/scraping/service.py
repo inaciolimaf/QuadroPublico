@@ -4,10 +4,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from queue import Queue
 
-from sqlalchemy import text, select
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models import Contracheque, SyncLog
+from app.models import Cargo, Contracheque, Funcionario, SyncLog
 from app.scraping.fetcher import fetch_page
 from app.scraping.parser import (
     EmployeeRecord,
@@ -87,56 +88,34 @@ def _discover_available_periods() -> list[tuple[int, int]]:
     return all_periods
 
 
-# ---------- Batch SQL ----------
+# ---------- Batch operations usando SQLAlchemy Core + pg dialect ----------
 
 def _batch_ensure_funcionarios(
     db: Session,
     records: list[EmployeeRecord],
     cache: dict[tuple[str, str | None], int],
 ) -> None:
-    """Garante que todos os funcionários existem no banco e atualiza o cache.
-    Faz no máximo 2 roundtrips: 1 batch INSERT + 1 batch SELECT."""
-    # Identifica chaves que não estão no cache
-    needed: dict[tuple[str, str | None], EmployeeRecord] = {}
+    """Garante funcionários no banco. 1 INSERT multi-row + 1 SELECT com ANY."""
+    needed_keys: set[tuple[str, str | None]] = set()
     for r in records:
         key = (r.nome, r.cpf_parcial)
         if key not in cache:
-            needed[key] = r
+            needed_keys.add(key)
 
-    if not needed:
+    if not needed_keys:
         return
 
-    # Batch INSERT ... ON CONFLICT DO NOTHING (1 roundtrip via executemany)
-    insert_params = [{"nome": k[0], "cpf_parcial": k[1]} for k in needed]
-    db.execute(
-        text("""
-            INSERT INTO funcionarios (nome, cpf_parcial)
-            VALUES (:nome, :cpf_parcial)
-            ON CONFLICT ON CONSTRAINT uq_funcionario_nome_cpf DO NOTHING
-        """),
-        insert_params,
-    )
+    # 1) Multi-row INSERT ... ON CONFLICT DO NOTHING (1 roundtrip)
+    values = [{"nome": k[0], "cpf_parcial": k[1]} for k in needed_keys]
+    stmt = pg_insert(Funcionario.__table__).values(values)
+    stmt = stmt.on_conflict_do_nothing(constraint="uq_funcionario_nome_cpf")
+    db.execute(stmt)
 
-    # Batch SELECT para pegar os IDs (1 roundtrip)
-    # Usa VALUES join com IS NOT DISTINCT FROM para tratar NULLs
-    # Constrói query dinâmica com placeholders numerados
-    values_clauses = []
-    params = {}
-    for i, (nome, cpf) in enumerate(needed):
-        values_clauses.append(f"(:n{i}, :c{i})")
-        params[f"n{i}"] = nome
-        params[f"c{i}"] = cpf
-
-    values_sql = ", ".join(values_clauses)
+    # 2) SELECT com ANY para buscar IDs (1 roundtrip)
+    names = list({k[0] for k in needed_keys})
     rows = db.execute(
-        text(f"""
-            SELECT f.id, f.nome, f.cpf_parcial
-            FROM funcionarios f
-            JOIN (VALUES {values_sql}) AS v(nome, cpf_parcial)
-              ON f.nome = v.nome
-             AND f.cpf_parcial IS NOT DISTINCT FROM v.cpf_parcial
-        """),
-        params,
+        text("SELECT id, nome, cpf_parcial FROM funcionarios WHERE nome = ANY(:names)"),
+        {"names": names},
     ).all()
 
     for row in rows:
@@ -149,19 +128,15 @@ def _batch_ensure_cargos(
     func_cache: dict[tuple[str, str | None], int],
     cargo_cache: dict[tuple[int, str], int],
 ) -> None:
-    """Garante que todos os cargos existem e estão atualizados.
-    Faz 1 roundtrip via executemany (UPSERT com RETURNING)."""
-    # Deduplica por (funcionario_id, matricula) — pega o último registro
-    unique: dict[tuple[int, str], EmployeeRecord] = {}
+    """Garante cargos no banco. 1 UPSERT multi-row + 1 SELECT com ANY."""
+    # Deduplica por (func_id, matricula)
+    unique: dict[tuple[int, str], dict] = {}
     for r in records:
         func_id = func_cache[(r.nome, r.cpf_parcial)]
-        unique[(func_id, r.matricula)] = r
-
-    upsert_params = []
-    for (func_id, matricula), r in unique.items():
-        upsert_params.append({
+        key = (func_id, r.matricula)
+        unique[key] = {
             "funcionario_id": func_id,
-            "matricula": matricula,
+            "matricula": r.matricula,
             "orgao": r.orgao,
             "setor": r.setor,
             "cargo": r.cargo,
@@ -169,57 +144,39 @@ def _batch_ensure_cargos(
             "data_admissao": r.data_admissao,
             "vinculo": r.vinculo,
             "carga_horaria_semanal": r.carga_horaria_semanal,
-        })
+        }
 
-    if not upsert_params:
+    if not unique:
         return
 
-    # executemany não retorna rows, então fazemos upsert + select separados
-    db.execute(
-        text("""
-            INSERT INTO cargos (funcionario_id, matricula, orgao, setor, cargo, cargo2,
-                                data_admissao, vinculo, carga_horaria_semanal)
-            VALUES (:funcionario_id, :matricula, :orgao, :setor, :cargo, :cargo2,
-                    :data_admissao, :vinculo, :carga_horaria_semanal)
-            ON CONFLICT ON CONSTRAINT uq_cargo_func_matricula
-            DO UPDATE SET orgao = EXCLUDED.orgao,
-                          setor = EXCLUDED.setor,
-                          cargo = EXCLUDED.cargo,
-                          cargo2 = EXCLUDED.cargo2,
-                          data_admissao = COALESCE(EXCLUDED.data_admissao, cargos.data_admissao),
-                          vinculo = COALESCE(EXCLUDED.vinculo, cargos.vinculo),
-                          carga_horaria_semanal = COALESCE(EXCLUDED.carga_horaria_semanal, cargos.carga_horaria_semanal),
-                          atualizado_em = NOW()
-        """),
-        upsert_params,
+    # 1) Multi-row UPSERT (1 roundtrip)
+    values = list(unique.values())
+    stmt = pg_insert(Cargo.__table__).values(values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_cargo_func_matricula",
+        set_={
+            "orgao": stmt.excluded.orgao,
+            "setor": stmt.excluded.setor,
+            "cargo": stmt.excluded.cargo,
+            "cargo2": stmt.excluded.cargo2,
+            "data_admissao": text("COALESCE(EXCLUDED.data_admissao, cargos.data_admissao)"),
+            "vinculo": text("COALESCE(EXCLUDED.vinculo, cargos.vinculo)"),
+            "carga_horaria_semanal": text("COALESCE(EXCLUDED.carga_horaria_semanal, cargos.carga_horaria_semanal)"),
+            "atualizado_em": text("NOW()"),
+        },
     )
+    db.execute(stmt)
 
-    # Busca IDs dos que não estão no cache
-    missing = [(fid, mat) for (fid, mat) in unique if (fid, mat) not in cargo_cache]
-    if not missing:
-        return
-
-    values_clauses = []
-    params = {}
-    for i, (fid, mat) in enumerate(missing):
-        values_clauses.append(f"(CAST(:f{i} AS int), :m{i})")
-        params[f"f{i}"] = fid
-        params[f"m{i}"] = mat
-
-    values_sql = ", ".join(values_clauses)
-    rows = db.execute(
-        text(f"""
-            SELECT c.id, c.funcionario_id, c.matricula
-            FROM cargos c
-            JOIN (VALUES {values_sql}) AS v(funcionario_id, matricula)
-              ON c.funcionario_id = v.funcionario_id
-             AND c.matricula = v.matricula
-        """),
-        params,
-    ).all()
-
-    for row in rows:
-        cargo_cache[(row[1], row[2])] = row[0]
+    # 2) SELECT IDs que não estão no cache (1 roundtrip)
+    missing_func_ids = list({fid for (fid, _) in unique if (fid, _) not in cargo_cache}
+                           | {fid for (fid, mat) in unique if (fid, mat) not in cargo_cache})
+    if missing_func_ids:
+        rows = db.execute(
+            text("SELECT id, funcionario_id, matricula FROM cargos WHERE funcionario_id = ANY(:ids)"),
+            {"ids": list(set(missing_func_ids))},
+        ).all()
+        for row in rows:
+            cargo_cache[(row[1], row[2])] = row[0]
 
 
 def _save_period_bulk(
@@ -230,22 +187,22 @@ def _save_period_bulk(
     func_id_cache: dict[tuple[str, str | None], int],
     cargo_id_cache: dict[tuple[int, str], int],
 ) -> tuple[int, int]:
-    """Salva registros de um período com batch operations (~4 roundtrips)."""
+    """Salva período inteiro em ~5 roundtrips ao banco."""
     if not records:
         return 0, 0
 
-    # 1) Batch ensure funcionários (max 2 roundtrips)
+    # 1) Funcionários: 2 roundtrips max
     _batch_ensure_funcionarios(db, records, func_id_cache)
 
-    # 2) Batch ensure cargos (max 2 roundtrips)
+    # 2) Cargos: 2 roundtrips max
     _batch_ensure_cargos(db, records, func_id_cache, cargo_id_cache)
 
-    # 3) Batch upsert contracheques (1 roundtrip)
-    cc_params = []
+    # 3) Contracheques: 1 roundtrip (multi-row UPSERT)
+    cc_values = []
     for r in records:
         func_id = func_id_cache[(r.nome, r.cpf_parcial)]
         cargo_id = cargo_id_cache[(func_id, r.matricula)]
-        cc_params.append({
+        cc_values.append({
             "cargo_id": cargo_id,
             "provento": float(r.provento),
             "desconto": float(r.desconto),
@@ -254,23 +211,19 @@ def _save_period_bulk(
             "referencia_ano": year,
         })
 
-    db.execute(
-        text("""
-            INSERT INTO contracheques (cargo_id, provento, desconto, liquido, referencia_mes, referencia_ano)
-            VALUES (:cargo_id, :provento, :desconto, :liquido, :referencia_mes, :referencia_ano)
-            ON CONFLICT ON CONSTRAINT uq_contracheque_cargo_ref
-            DO UPDATE SET provento = EXCLUDED.provento,
-                          desconto = EXCLUDED.desconto,
-                          liquido = EXCLUDED.liquido
-            WHERE contracheques.provento != EXCLUDED.provento
-               OR contracheques.desconto != EXCLUDED.desconto
-               OR contracheques.liquido != EXCLUDED.liquido
-        """),
-        cc_params,
+    stmt = pg_insert(Contracheque.__table__).values(cc_values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_contracheque_cargo_ref",
+        set_={
+            "provento": stmt.excluded.provento,
+            "desconto": stmt.excluded.desconto,
+            "liquido": stmt.excluded.liquido,
+        },
     )
+    db.execute(stmt)
 
     db.commit()
-    return len(records), len(cc_params)
+    return len(records), len(cc_values)
 
 
 def sync_all(db: Session) -> dict:
@@ -365,7 +318,6 @@ def sync_all(db: Session) -> dict:
         except Exception as e:
             print(f"[SYNC] ERRO ao salvar {year}/{month:02d}: {e}")
             db.rollback()
-            # Limpa caches — IDs podem ser de transação que foi revertida
             func_id_cache.clear()
             cargo_id_cache.clear()
             errors += 1
