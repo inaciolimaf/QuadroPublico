@@ -88,47 +88,73 @@ def _discover_available_periods() -> list[tuple[int, int]]:
     return all_periods
 
 
-# ---------- Batch operations usando SQLAlchemy Core + pg dialect ----------
+# ---------- Cache preloading ----------
 
-def _batch_ensure_funcionarios(
+def _preload_func_cache(db: Session) -> dict[tuple[str, str | None], int]:
+    """Carrega todos os funcionários existentes no cache. 1 query."""
+    rows = db.execute(
+        text("SELECT id, nome, cpf_parcial FROM funcionarios")
+    ).all()
+    cache = {}
+    for row in rows:
+        cache[(row[1], row[2])] = row[0]
+    print(f"[CACHE] {len(cache)} funcionários pré-carregados")
+    return cache
+
+
+def _preload_cargo_cache(db: Session) -> dict[tuple[int, str], int]:
+    """Carrega todos os cargos existentes no cache. 1 query."""
+    rows = db.execute(
+        text("SELECT id, funcionario_id, matricula FROM cargos")
+    ).all()
+    cache = {}
+    for row in rows:
+        cache[(row[1], row[2])] = row[0]
+    print(f"[CACHE] {len(cache)} cargos pré-carregados")
+    return cache
+
+
+# ---------- Batch operations ----------
+
+def _batch_insert_new_funcionarios(
     db: Session,
     records: list[EmployeeRecord],
     cache: dict[tuple[str, str | None], int],
 ) -> None:
-    """Garante funcionários no banco. 1 INSERT multi-row + 1 SELECT com ANY."""
-    needed_keys: set[tuple[str, str | None]] = set()
+    """Insere funcionários que não existem no cache e atualiza o cache."""
+    new_funcs: dict[tuple[str, str | None], dict] = {}
     for r in records:
         key = (r.nome, r.cpf_parcial)
-        if key not in cache:
-            needed_keys.add(key)
+        if key not in cache and key not in new_funcs:
+            new_funcs[key] = {"nome": r.nome, "cpf_parcial": r.cpf_parcial}
 
-    if not needed_keys:
+    if not new_funcs:
         return
 
-    # 1) Multi-row INSERT ... ON CONFLICT DO NOTHING (1 roundtrip)
-    values = [{"nome": k[0], "cpf_parcial": k[1]} for k in needed_keys]
-    stmt = pg_insert(Funcionario.__table__).values(values)
-    stmt = stmt.on_conflict_do_nothing(constraint="uq_funcionario_nome_cpf")
-    db.execute(stmt)
+    # INSERT simples (sem ON CONFLICT — sabemos que são novos pelo cache)
+    values = list(new_funcs.values())
+    db.execute(
+        Funcionario.__table__.insert(),
+        values,
+    )
 
-    # 2) SELECT com ANY para buscar IDs (1 roundtrip)
-    names = list({k[0] for k in needed_keys})
+    # SELECT os recém-inseridos para pegar IDs
+    names = list({v["nome"] for v in values})
     rows = db.execute(
         text("SELECT id, nome, cpf_parcial FROM funcionarios WHERE nome = ANY(:names)"),
         {"names": names},
     ).all()
-
     for row in rows:
         cache[(row[1], row[2])] = row[0]
 
 
-def _batch_ensure_cargos(
+def _batch_upsert_cargos(
     db: Session,
     records: list[EmployeeRecord],
     func_cache: dict[tuple[str, str | None], int],
     cargo_cache: dict[tuple[int, str], int],
 ) -> None:
-    """Garante cargos no banco. 1 UPSERT multi-row + 1 SELECT com ANY."""
+    """Upsert cargos em batch e atualiza o cache."""
     # Deduplica por (func_id, matricula)
     unique: dict[tuple[int, str], dict] = {}
     for r in records:
@@ -149,7 +175,7 @@ def _batch_ensure_cargos(
     if not unique:
         return
 
-    # 1) Multi-row UPSERT (1 roundtrip)
+    # Multi-row UPSERT (1 roundtrip)
     values = list(unique.values())
     stmt = pg_insert(Cargo.__table__).values(values)
     stmt = stmt.on_conflict_do_update(
@@ -167,13 +193,12 @@ def _batch_ensure_cargos(
     )
     db.execute(stmt)
 
-    # 2) SELECT IDs que não estão no cache (1 roundtrip)
-    missing_func_ids = list({fid for (fid, _) in unique if (fid, _) not in cargo_cache}
-                           | {fid for (fid, mat) in unique if (fid, mat) not in cargo_cache})
+    # Busca IDs dos que não estão no cache
+    missing_func_ids = list({fid for (fid, mat) in unique if (fid, mat) not in cargo_cache})
     if missing_func_ids:
         rows = db.execute(
             text("SELECT id, funcionario_id, matricula FROM cargos WHERE funcionario_id = ANY(:ids)"),
-            {"ids": list(set(missing_func_ids))},
+            {"ids": missing_func_ids},
         ).all()
         for row in rows:
             cargo_cache[(row[1], row[2])] = row[0]
@@ -191,13 +216,13 @@ def _save_period_bulk(
     if not records:
         return 0, 0
 
-    # 1) Funcionários: 2 roundtrips max
-    _batch_ensure_funcionarios(db, records, func_id_cache)
+    # 1) Funcionários novos
+    _batch_insert_new_funcionarios(db, records, func_id_cache)
 
-    # 2) Cargos: 2 roundtrips max
-    _batch_ensure_cargos(db, records, func_id_cache, cargo_id_cache)
+    # 2) Cargos (upsert)
+    _batch_upsert_cargos(db, records, func_id_cache, cargo_id_cache)
 
-    # 3) Contracheques: 1 roundtrip (multi-row UPSERT)
+    # 3) Contracheques (upsert)
     cc_values = []
     for r in records:
         func_id = func_id_cache[(r.nome, r.cpf_parcial)]
@@ -264,8 +289,10 @@ def sync_all(db: Session) -> dict:
         }
 
     to_fetch_sorted = sorted(to_fetch)
-    func_id_cache: dict[tuple[str, str | None], int] = {}
-    cargo_id_cache: dict[tuple[int, str], int] = {}
+
+    # Pré-carrega caches com dados existentes (2 queries)
+    func_id_cache = _preload_func_cache(db)
+    cargo_id_cache = _preload_cargo_cache(db)
 
     total_records = 0
     total_contracheques = 0
@@ -318,8 +345,11 @@ def sync_all(db: Session) -> dict:
         except Exception as e:
             print(f"[SYNC] ERRO ao salvar {year}/{month:02d}: {e}")
             db.rollback()
+            # Recarrega caches do zero após rollback
             func_id_cache.clear()
+            func_id_cache.update(_preload_func_cache(db))
             cargo_id_cache.clear()
+            cargo_id_cache.update(_preload_cargo_cache(db))
             errors += 1
 
     producer_thread.join()
