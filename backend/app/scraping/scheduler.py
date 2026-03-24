@@ -4,27 +4,26 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func
 
 from app.database import SessionLocal
-from app.models import Contracheque
+from app.models import SyncLog
 from app.scraping.service import sync_all
 
 SYNC_INTERVAL_HOURS = 24
 
 
 def _needs_sync() -> bool:
-    """Verifica se a última sync foi há mais de SYNC_INTERVAL_HOURS."""
+    """Verifica se o último sync COMPLETO E BEM-SUCEDIDO foi há mais de SYNC_INTERVAL_HOURS."""
     db = SessionLocal()
     try:
-        stmt = select(func.max(Contracheque.criado_em))
-        last_sync = db.scalar(stmt)
-        if last_sync is None:
-            print("[SCHEDULER] Banco vazio, sync necessário")
+        stmt = select(func.max(SyncLog.finalizado_em)).where(SyncLog.sucesso == True)
+        last_success = db.scalar(stmt)
+        if last_success is None:
+            print("[SCHEDULER] Nenhum sync completo encontrado, sync necessário")
             return True
-        # criado_em pode não ter timezone, normaliza
-        if last_sync.tzinfo is None:
-            last_sync = last_sync.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - last_sync
+        if last_success.tzinfo is None:
+            last_success = last_success.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - last_success
         hours = age.total_seconds() / 3600
-        print(f"[SCHEDULER] Última sync há {hours:.1f}h (limite: {SYNC_INTERVAL_HOURS}h)")
+        print(f"[SCHEDULER] Último sync completo há {hours:.1f}h (limite: {SYNC_INTERVAL_HOURS}h)")
         return age > timedelta(hours=SYNC_INTERVAL_HOURS)
     finally:
         db.close()

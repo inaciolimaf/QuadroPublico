@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -114,3 +115,23 @@ class Contracheque(Base):
 
     def __repr__(self) -> str:
         return f"<Contracheque cargo_id={self.cargo_id} {self.referencia_mes}/{self.referencia_ano}>"
+
+
+class SyncLog(Base):
+    """Registro de execução de sync — só grava quando o sync completa com sucesso."""
+
+    __tablename__ = "sync_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    iniciado_em: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    finalizado_em: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    sucesso: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    periodos_sincronizados: Mapped[int] = mapped_column(Integer, default=0)
+    contracheques_novos: Mapped[int] = mapped_column(Integer, default=0)
+
+    def __repr__(self) -> str:
+        return f"<SyncLog {self.iniciado_em} sucesso={self.sucesso}>"
