@@ -19,7 +19,7 @@ from app.scraping.parser import (
 
 SPECIAL_MONTHS_THRESHOLD = 13
 MAX_WORKERS = 4 if os.getenv("ENV") == "production" else 12
-PREFETCH_BUFFER = 3
+PREFETCH_BUFFER = 2
 
 
 def _get_existing_months(db: Session) -> set[tuple[int, int]]:
@@ -114,7 +114,7 @@ def _preload_cargo_cache(db: Session) -> dict[tuple[int, str], int]:
     return cache
 
 
-BATCH_SIZE = 200  # Rows por INSERT (evita estourar memória do Postgres)
+BATCH_SIZE = 50  # Rows por INSERT (Fly Postgres tem pouca memória)
 
 
 # ---------- Batch operations ----------
