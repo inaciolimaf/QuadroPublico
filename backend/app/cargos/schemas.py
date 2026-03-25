@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from app.contracheques.schemas import ContrachequeOut
 
 
 class CargoCreate(BaseModel):
@@ -42,7 +48,7 @@ class CargoOut(BaseModel):
 
 
 class CargoDetail(CargoOut):
-    contracheques: list["ContrachequeOut"] = []
+    contracheques: list[ContrachequeOut] = []
 
 
 from app.contracheques.schemas import ContrachequeOut  # noqa: E402

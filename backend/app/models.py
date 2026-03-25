@@ -21,8 +21,6 @@ def _utcnow() -> datetime:
 
 
 class Funcionario(Base):
-    """Pessoa física — identificada por nome + CPF parcial."""
-
     __tablename__ = "funcionarios"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -48,8 +46,6 @@ class Funcionario(Base):
 
 
 class Cargo(Base):
-    """Vínculo/cargo de um funcionário — cada matrícula é um cargo distinto."""
-
     __tablename__ = "cargos"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -85,8 +81,6 @@ class Cargo(Base):
 
 
 class Contracheque(Base):
-    """Registro mensal de contracheque — vinculado a um cargo específico."""
-
     __tablename__ = "contracheques"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -106,9 +100,7 @@ class Contracheque(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "cargo_id",
-            "referencia_mes",
-            "referencia_ano",
+            "cargo_id", "referencia_mes", "referencia_ano",
             name="uq_contracheque_cargo_ref",
         ),
     )
@@ -118,8 +110,6 @@ class Contracheque(Base):
 
 
 class SyncLog(Base):
-    """Registro de execução de sync — só grava quando o sync completa com sucesso."""
-
     __tablename__ = "sync_logs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -132,6 +122,3 @@ class SyncLog(Base):
     sucesso: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     periodos_sincronizados: Mapped[int] = mapped_column(Integer, default=0)
     contracheques_novos: Mapped[int] = mapped_column(Integer, default=0)
-
-    def __repr__(self) -> str:
-        return f"<SyncLog {self.iniciado_em} sucesso={self.sucesso}>"

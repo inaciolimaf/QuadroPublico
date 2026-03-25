@@ -20,6 +20,12 @@ from app.scraping.parser import (
 SPECIAL_MONTHS_THRESHOLD = 13
 MAX_WORKERS = 4 if os.getenv("ENV") == "production" else 12
 PREFETCH_BUFFER = 2
+BATCH_SIZE = 50
+
+
+def _chunked(lst: list, size: int):
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
 
 
 def _get_existing_months(db: Session) -> set[tuple[int, int]]:
@@ -60,76 +66,45 @@ def _fetch_and_parse(year: int, month: int) -> tuple[int, int, list[EmployeeReco
     html = fetch_page(year, month)
     raw = parse_page(html)
     records = _aggregate_records(raw)
-    print(f"[PARSE] {year}/{month:02d}: {len(raw)} linhas -> {len(records)} registros")
     return year, month, records
 
 
 def _discover_available_periods() -> list[tuple[int, int]]:
-    print("[DISCOVERY] Buscando anos disponíveis...")
     html = fetch_page(2026, 1)
     years = parse_available_years(html)
-    print(f"[DISCOVERY] Anos encontrados: {years}")
-
     all_periods: list[tuple[int, int]] = []
 
-    def _fetch_months_for_year(year: int) -> list[tuple[int, int]]:
-        html = fetch_page(year, 1)
-        months = parse_available_months(html, year)
-        print(f"[DISCOVERY] {year}: meses disponíveis = {months}")
+    def fetch_months(year: int) -> list[tuple[int, int]]:
+        page_html = fetch_page(year, 1)
+        months = parse_available_months(page_html, year)
         return [(year, m) for m in months]
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_months_for_year, y): y for y in years}
+        futures = {executor.submit(fetch_months, y): y for y in years}
         for future in as_completed(futures):
             all_periods.extend(future.result())
 
     all_periods.sort()
-    print(f"[DISCOVERY] Total de períodos: {len(all_periods)}")
     return all_periods
 
 
-# ---------- Cache preloading ----------
-
 def _preload_func_cache(db: Session) -> dict[tuple[str, str | None], int]:
-    """Carrega todos os funcionários existentes no cache. 1 query."""
-    rows = db.execute(
-        text("SELECT id, nome, cpf_parcial FROM funcionarios")
-    ).all()
-    cache = {}
-    for row in rows:
-        cache[(row[1], row[2])] = row[0]
-    print(f"[CACHE] {len(cache)} funcionários pré-carregados")
-    return cache
+    rows = db.execute(text("SELECT id, nome, cpf_parcial FROM funcionarios")).all()
+    return {(row[1], row[2]): row[0] for row in rows}
 
 
 def _preload_cargo_cache(db: Session) -> dict[tuple[int, str], int]:
-    """Carrega todos os cargos existentes no cache. 1 query."""
     rows = db.execute(
         text("SELECT id, funcionario_id, matricula FROM cargos")
     ).all()
-    cache = {}
-    for row in rows:
-        cache[(row[1], row[2])] = row[0]
-    print(f"[CACHE] {len(cache)} cargos pré-carregados")
-    return cache
+    return {(row[1], row[2]): row[0] for row in rows}
 
 
-BATCH_SIZE = 50  # Rows por INSERT (Fly Postgres tem pouca memória)
-
-
-# ---------- Batch operations ----------
-
-def _chunked(lst: list, size: int):
-    """Divide lista em chunks de tamanho fixo."""
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
-
-def _batch_insert_new_funcionarios(
+def _batch_insert_funcionarios(
     db: Session,
     records: list[EmployeeRecord],
     cache: dict[tuple[str, str | None], int],
 ) -> None:
-    """Insere funcionários que não existem no cache e atualiza o cache."""
     new_funcs: dict[tuple[str, str | None], dict] = {}
     for r in records:
         key = (r.nome, r.cpf_parcial)
@@ -139,12 +114,10 @@ def _batch_insert_new_funcionarios(
     if not new_funcs:
         return
 
-    # INSERT simples em chunks (sem ON CONFLICT — sabemos que são novos pelo cache)
     values = list(new_funcs.values())
     for chunk in _chunked(values, BATCH_SIZE):
         db.execute(Funcionario.__table__.insert(), chunk)
 
-    # SELECT os recém-inseridos para pegar IDs
     names = list({v["nome"] for v in values})
     rows = db.execute(
         text("SELECT id, nome, cpf_parcial FROM funcionarios WHERE nome = ANY(:names)"),
@@ -160,8 +133,6 @@ def _batch_upsert_cargos(
     func_cache: dict[tuple[str, str | None], int],
     cargo_cache: dict[tuple[int, str], int],
 ) -> None:
-    """Upsert cargos em batch e atualiza o cache."""
-    # Deduplica por (func_id, matricula)
     unique: dict[tuple[int, str], dict] = {}
     for r in records:
         func_id = func_cache[(r.nome, r.cpf_parcial)]
@@ -181,7 +152,6 @@ def _batch_upsert_cargos(
     if not unique:
         return
 
-    # Multi-row UPSERT em chunks
     values = list(unique.values())
     for chunk in _chunked(values, BATCH_SIZE):
         stmt = pg_insert(Cargo.__table__).values(chunk)
@@ -200,7 +170,6 @@ def _batch_upsert_cargos(
         )
         db.execute(stmt)
 
-    # Busca IDs dos que não estão no cache
     missing_func_ids = list({fid for (fid, mat) in unique if (fid, mat) not in cargo_cache})
     if missing_func_ids:
         rows = db.execute(
@@ -211,29 +180,18 @@ def _batch_upsert_cargos(
             cargo_cache[(row[1], row[2])] = row[0]
 
 
-def _save_period_bulk(
+def _batch_upsert_contracheques(
     db: Session,
     year: int,
     month: int,
     records: list[EmployeeRecord],
-    func_id_cache: dict[tuple[str, str | None], int],
-    cargo_id_cache: dict[tuple[int, str], int],
-) -> tuple[int, int]:
-    """Salva período inteiro em ~5 roundtrips ao banco."""
-    if not records:
-        return 0, 0
-
-    # 1) Funcionários novos
-    _batch_insert_new_funcionarios(db, records, func_id_cache)
-
-    # 2) Cargos (upsert)
-    _batch_upsert_cargos(db, records, func_id_cache, cargo_id_cache)
-
-    # 3) Contracheques (upsert)
+    func_cache: dict[tuple[str, str | None], int],
+    cargo_cache: dict[tuple[int, str], int],
+) -> int:
     cc_values = []
     for r in records:
-        func_id = func_id_cache[(r.nome, r.cpf_parcial)]
-        cargo_id = cargo_id_cache[(func_id, r.matricula)]
+        func_id = func_cache[(r.nome, r.cpf_parcial)]
+        cargo_id = cargo_cache[(func_id, r.matricula)]
         cc_values.append({
             "cargo_id": cargo_id,
             "provento": float(r.provento),
@@ -255,124 +213,140 @@ def _save_period_bulk(
         )
         db.execute(stmt)
 
+    return len(cc_values)
+
+
+def _save_period(
+    db: Session,
+    year: int,
+    month: int,
+    records: list[EmployeeRecord],
+    func_cache: dict[tuple[str, str | None], int],
+    cargo_cache: dict[tuple[int, str], int],
+) -> tuple[int, int]:
+    if not records:
+        return 0, 0
+
+    _batch_insert_funcionarios(db, records, func_cache)
+    _batch_upsert_cargos(db, records, func_cache, cargo_cache)
+    cc_count = _batch_upsert_contracheques(db, year, month, records, func_cache, cargo_cache)
     db.commit()
-    return len(records), len(cc_values)
+    return len(records), cc_count
 
 
-def sync_all(db: Session) -> dict:
-    """Pipeline produtor/consumidor + bulk upsert."""
-    inicio = datetime.now(timezone.utc)
-
-    existing = _get_existing_months(db)
-    print(f"[SYNC] Meses já no banco: {len(existing)}")
-
-    all_periods = _discover_available_periods()
-    current_year = datetime.now(timezone.utc).year
-
-    missing: list[tuple[int, int]] = []
-    refresh: list[tuple[int, int]] = []
+def _classify_periods(
+    all_periods: list[tuple[int, int]],
+    existing: set[tuple[int, int]],
+    current_year: int,
+) -> list[tuple[int, int]]:
+    missing = []
+    refresh = []
     for y, m in all_periods:
         if (y, m) not in existing:
             missing.append((y, m))
         elif m >= SPECIAL_MONTHS_THRESHOLD and y == current_year:
             refresh.append((y, m))
+    return sorted(missing + refresh)
 
-    to_fetch = missing + refresh
-    print(f"[SYNC] Faltando: {len(missing)}, refresh 13º: {len(refresh)}, total: {len(to_fetch)}")
 
-    if not to_fetch:
-        print("[SYNC] Banco já está atualizado!")
-        log = SyncLog(
-            iniciado_em=inicio,
-            sucesso=True,
-            periodos_sincronizados=0,
-            contracheques_novos=0,
-        )
-        db.add(log)
-        db.commit()
-        return {
-            "status": "up_to_date",
-            "total_periods": len(all_periods),
-            "synced": 0,
-        }
+def _create_sync_log(db: Session, inicio: datetime, **kwargs) -> SyncLog:
+    log = SyncLog(iniciado_em=inicio, **kwargs)
+    db.add(log)
+    db.commit()
+    return log
 
-    to_fetch_sorted = sorted(to_fetch)
 
-    # Pré-carrega caches com dados existentes (2 queries)
-    func_id_cache = _preload_func_cache(db)
-    cargo_id_cache = _preload_cargo_cache(db)
+def _start_producer(to_fetch: list[tuple[int, int]], queue: Queue) -> threading.Thread:
+    def produce():
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_fetch_and_parse, y, m): (y, m)
+                for y, m in to_fetch
+            }
+            for future in as_completed(futures):
+                try:
+                    queue.put(future.result())
+                except Exception:
+                    queue.put(None)
+        queue.put("DONE")
 
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    return thread
+
+
+def _consume_results(
+    db: Session,
+    queue: Queue,
+    total_to_process: int,
+    func_cache: dict[tuple[str, str | None], int],
+    cargo_cache: dict[tuple[int, str], int],
+) -> tuple[int, int, int, int]:
     total_records = 0
     total_contracheques = 0
     synced_periods = 0
     errors = 0
 
-    result_queue: Queue = Queue(maxsize=PREFETCH_BUFFER)
-
-    def _producer():
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(_fetch_and_parse, y, m): (y, m)
-                for y, m in to_fetch_sorted
-            }
-            for future in as_completed(futures):
-                y, m = futures[future]
-                try:
-                    result = future.result()
-                    result_queue.put(result)
-                except Exception as e:
-                    print(f"[SYNC] ERRO ao buscar {y}/{m:02d}: {e}")
-                    result_queue.put(None)
-        result_queue.put("DONE")
-
-    producer_thread = threading.Thread(target=_producer, daemon=True)
-    producer_thread.start()
-
-    processed = 0
-    total_to_process = len(to_fetch_sorted)
     while True:
-        item = result_queue.get()
+        item = queue.get()
         if item == "DONE":
             break
         if item is None:
             errors += 1
-            processed += 1
             continue
 
         year, month, records = item
-        processed += 1
-        print(f"[SYNC] [{processed}/{total_to_process}] Salvando {year}/{month:02d} ({len(records)} registros)...")
         try:
-            rec_count, cc_count = _save_period_bulk(
-                db, year, month, records, func_id_cache, cargo_id_cache
+            rec_count, cc_count = _save_period(
+                db, year, month, records, func_cache, cargo_cache
             )
             total_records += rec_count
             total_contracheques += cc_count
             synced_periods += 1
-            print(f"[SYNC] [{processed}/{total_to_process}] {year}/{month:02d} salvo!")
-        except Exception as e:
-            print(f"[SYNC] ERRO ao salvar {year}/{month:02d}: {e}")
+        except Exception:
             db.rollback()
-            # Recarrega caches do zero após rollback
-            func_id_cache.clear()
-            func_id_cache.update(_preload_func_cache(db))
-            cargo_id_cache.clear()
-            cargo_id_cache.update(_preload_cargo_cache(db))
+            func_cache.clear()
+            func_cache.update(_preload_func_cache(db))
+            cargo_cache.clear()
+            cargo_cache.update(_preload_cargo_cache(db))
             errors += 1
 
-    producer_thread.join()
+    return total_records, total_contracheques, synced_periods, errors
 
-    sucesso = errors == 0
-    log = SyncLog(
-        iniciado_em=inicio,
-        sucesso=sucesso,
+
+def sync_all(db: Session) -> dict:
+    inicio = datetime.now(timezone.utc)
+
+    existing = _get_existing_months(db)
+    all_periods = _discover_available_periods()
+    current_year = datetime.now(timezone.utc).year
+
+    to_fetch = _classify_periods(all_periods, existing, current_year)
+
+    if not to_fetch:
+        _create_sync_log(db, inicio, sucesso=True, periodos_sincronizados=0, contracheques_novos=0)
+        return {"status": "up_to_date", "total_periods": len(all_periods), "synced": 0}
+
+    func_cache = _preload_func_cache(db)
+    cargo_cache = _preload_cargo_cache(db)
+
+    queue: Queue = Queue(maxsize=PREFETCH_BUFFER)
+    producer = _start_producer(to_fetch, queue)
+
+    total_records, total_contracheques, synced_periods, errors = _consume_results(
+        db, queue, len(to_fetch), func_cache, cargo_cache
+    )
+
+    producer.join()
+
+    _create_sync_log(
+        db,
+        inicio,
+        sucesso=errors == 0,
         periodos_sincronizados=synced_periods,
         contracheques_novos=total_contracheques,
     )
-    db.add(log)
-    db.commit()
 
-    print(f"[SYNC] Concluído! {total_contracheques} contracheques, {total_records} registros (erros: {errors})")
     return {
         "status": "synced",
         "total_periods": len(all_periods),

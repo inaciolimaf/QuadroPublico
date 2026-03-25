@@ -11,11 +11,13 @@ export function useFuncionarios() {
   const [funcionarios, setFuncionarios] = useState<Funcionario[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const debouncedQuery = useDebounce(query, 400)
 
   const fetchData = useCallback(async (q: string, p: number) => {
     setLoading(true)
+    setError(null)
     try {
       const data = await listFuncionarios({
         q: q || undefined,
@@ -24,8 +26,10 @@ export function useFuncionarios() {
       })
       setFuncionarios(data.items)
       setTotal(data.total)
-    } catch (err) {
-      console.error("Erro ao buscar funcionários:", err)
+    } catch {
+      setError("Erro ao buscar funcionários. Tente novamente.")
+      setFuncionarios([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }
@@ -43,6 +47,7 @@ export function useFuncionarios() {
     funcionarios,
     total,
     loading,
+    error,
     query,
     setQuery,
     page,

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -10,7 +10,10 @@ router = APIRouter(prefix="/funcionarios", tags=["funcionarios"])
 
 @router.get("/", response_model=PaginatedFuncionarios)
 def list_funcionarios(
-    q: str | None = None, skip: int = 0, limit: int = 50, db: Session = Depends(get_db)
+    q: str | None = Query(None, max_length=200),
+    skip: int = Query(0, ge=0, le=100_000),
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
     items = repo.search_funcionarios(db, query=q, skip=skip, limit=limit)
     total = repo.count_funcionarios(db, query=q)

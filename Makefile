@@ -11,3 +11,4 @@ build:
 
 test:
 	cd backend && pip install -r requirements-dev.txt -q && pytest -v
+	cd frontend && npm test

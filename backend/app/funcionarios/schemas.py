@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from app.cargos.schemas import CargoOut
 
 
 class FuncionarioOut(BaseModel):
@@ -14,7 +20,7 @@ class FuncionarioOut(BaseModel):
 
 
 class FuncionarioDetail(FuncionarioOut):
-    cargos: list["CargoOut"] = []
+    cargos: list[CargoOut] = []
 
 
 class PaginatedFuncionarios(BaseModel):
