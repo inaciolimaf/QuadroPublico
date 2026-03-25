@@ -6,7 +6,7 @@ import { SearchBar } from "./SearchBar"
 describe("SearchBar", () => {
   it("renderiza input com placeholder", () => {
     render(<SearchBar value="" onChange={() => {}} />)
-    expect(screen.getByPlaceholderText("Buscar funcionário por nome...")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Buscar funcionario por nome...")).toBeInTheDocument()
   })
 
   it("chama onChange ao digitar", async () => {
@@ -17,12 +17,12 @@ describe("SearchBar", () => {
     expect(onChange).toHaveBeenCalledWith("a")
   })
 
-  it("mostra botão limpar quando tem valor", () => {
+  it("mostra botao limpar quando tem valor", () => {
     render(<SearchBar value="teste" onChange={() => {}} />)
     expect(screen.getByRole("button", { name: "Limpar busca" })).toBeInTheDocument()
   })
 
-  it("não mostra botão limpar quando vazio", () => {
+  it("nao mostra botao limpar quando vazio", () => {
     render(<SearchBar value="" onChange={() => {}} />)
     expect(screen.queryByRole("button", { name: "Limpar busca" })).not.toBeInTheDocument()
   })
@@ -39,8 +39,8 @@ describe("SearchBar", () => {
     expect(screen.getByRole("textbox")).toHaveAttribute("maxLength", "200")
   })
 
-  it("tem label acessível", () => {
+  it("tem label acessivel", () => {
     render(<SearchBar value="" onChange={() => {}} />)
-    expect(screen.getByLabelText("Buscar funcionário por nome")).toBeInTheDocument()
+    expect(screen.getByLabelText("Buscar funcionario por nome")).toBeInTheDocument()
   })
 })

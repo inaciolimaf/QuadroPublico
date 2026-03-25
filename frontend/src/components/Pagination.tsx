@@ -1,4 +1,5 @@
 import { ChevronLeft, ChevronRight } from "lucide-react"
+import { Button } from "@/components/ui/button"
 
 interface PaginationProps {
   page: number
@@ -15,66 +16,67 @@ export function Pagination({ page, totalPages, onPageChange }: PaginationProps) 
   for (let i = start; i <= end; i++) pages.push(i)
 
   return (
-    <nav className="flex items-center justify-center gap-1 mt-6" aria-label="Paginação">
-      <button
+    <nav className="flex items-center justify-center gap-1" aria-label="Paginacao">
+      <Button
+        variant="ghost"
+        size="icon"
         onClick={() => onPageChange(page - 1)}
         disabled={page === 0}
-        aria-label="Página anterior"
-        className="p-2 rounded-md hover:bg-zinc-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+        aria-label="Pagina anterior"
       >
         <ChevronLeft className="h-4 w-4" aria-hidden="true" />
-      </button>
+      </Button>
 
       {start > 0 && (
         <>
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => onPageChange(0)}
-            aria-label="Ir para página 1"
-            className="px-3 py-1 rounded-md text-sm hover:bg-zinc-100 transition-colors"
+            aria-label="Ir para pagina 1"
           >
             1
-          </button>
-          {start > 1 && <span className="px-1 text-zinc-400" aria-hidden="true">...</span>}
+          </Button>
+          {start > 1 && <span className="px-1 text-muted-foreground text-sm" aria-hidden="true">...</span>}
         </>
       )}
 
       {pages.map((p) => (
-        <button
+        <Button
           key={p}
+          variant={p === page ? "default" : "ghost"}
+          size="sm"
           onClick={() => onPageChange(p)}
-          aria-label={`Ir para página ${p + 1}`}
+          aria-label={`Ir para pagina ${p + 1}`}
           aria-current={p === page ? "page" : undefined}
-          className={`px-3 py-1 rounded-md text-sm transition-colors ${
-            p === page
-              ? "bg-zinc-900 text-white"
-              : "hover:bg-zinc-100"
-          }`}
         >
           {p + 1}
-        </button>
+        </Button>
       ))}
 
       {end < totalPages - 1 && (
         <>
-          {end < totalPages - 2 && <span className="px-1 text-zinc-400" aria-hidden="true">...</span>}
-          <button
+          {end < totalPages - 2 && <span className="px-1 text-muted-foreground text-sm" aria-hidden="true">...</span>}
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => onPageChange(totalPages - 1)}
-            aria-label={`Ir para página ${totalPages}`}
-            className="px-3 py-1 rounded-md text-sm hover:bg-zinc-100 transition-colors"
+            aria-label={`Ir para pagina ${totalPages}`}
           >
             {totalPages}
-          </button>
+          </Button>
         </>
       )}
 
-      <button
+      <Button
+        variant="ghost"
+        size="icon"
         onClick={() => onPageChange(page + 1)}
         disabled={page >= totalPages - 1}
-        aria-label="Próxima página"
-        className="p-2 rounded-md hover:bg-zinc-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+        aria-label="Proxima pagina"
       >
         <ChevronRight className="h-4 w-4" aria-hidden="true" />
-      </button>
+      </Button>
     </nav>
   )
 }
