@@ -48,7 +48,21 @@ export function FuncionarioCard({ funcionario }: Props) {
     fetchContracheques(detail.cargos)
   }, [detail, fetchContracheques])
 
-  const latestCargo = detail?.cargos?.[0] ?? null
+  const cargoActivity = useCallback(
+    (cargoId: number) => {
+      const ccs = contrachequesByCargo[cargoId]
+      if (!ccs || ccs.length === 0) return -1
+      const last = ccs[ccs.length - 1]
+      return last.referencia_ano * 100 + last.referencia_mes
+    },
+    [contrachequesByCargo]
+  )
+
+  const sortedCargos = detail?.cargos
+    ? [...detail.cargos].sort((a, b) => cargoActivity(b.id) - cargoActivity(a.id))
+    : []
+
+  const latestCargo = sortedCargos[0] ?? null
   const displayError = error || errorCc
 
   return (
@@ -121,7 +135,7 @@ export function FuncionarioCard({ funcionario }: Props) {
                     {detail.cargos.length}
                   </Badge>
                 </div>
-                {detail.cargos.map((cargo) => (
+                {sortedCargos.map((cargo) => (
                   <CargoItem
                     key={cargo.id}
                     cargo={cargo}
