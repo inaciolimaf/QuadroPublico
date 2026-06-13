@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models import Cargo, Contracheque, Funcionario, SyncLog
-from app.scraping.fetcher import fetch_page
+from app.scraping.fetcher import fetch_all_pages, fetch_page
 from app.scraping.parser import (
     EmployeeRecord,
     parse_available_months,
@@ -66,8 +66,9 @@ def _aggregate_records(records: list[EmployeeRecord]) -> list[EmployeeRecord]:
 
 
 def _fetch_and_parse(year: int, month: int) -> tuple[int, int, list[EmployeeRecord]]:
-    html = fetch_page(year, month)
-    raw = parse_page(html)
+    raw: list[EmployeeRecord] = []
+    for html in fetch_all_pages(year, month):
+        raw.extend(parse_page(html))
     records = _aggregate_records(raw)
     return year, month, records
 
