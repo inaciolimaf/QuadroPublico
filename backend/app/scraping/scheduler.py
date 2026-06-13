@@ -32,6 +32,10 @@ def _needs_sync() -> bool:
 def _run_sync():
     try:
         if not _needs_sync():
+            logger.info(
+                "Sync automático pulado: última sincronização há menos de %dh",
+                SYNC_INTERVAL_HOURS,
+            )
             return
         db = SessionLocal()
         try:
@@ -43,11 +47,15 @@ def _run_sync():
 
 
 def _sync_loop():
+    logger.info(
+        "Loop de sync automático iniciado (intervalo de %dh)", SYNC_INTERVAL_HOURS
+    )
     while True:
         try:
             _run_sync()
         except Exception:  # noqa: BLE001 - o loop nunca pode morrer
             logger.exception("Erro inesperado no loop de sync automático")
+        logger.info("Próximo sync automático em %dh", SYNC_INTERVAL_HOURS)
         time.sleep(SYNC_INTERVAL_HOURS * 3600)
 
 

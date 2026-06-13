@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +17,8 @@ from app.scraping.parser import (
     parse_available_years,
     parse_page,
 )
+
+logger = logging.getLogger(__name__)
 
 SPECIAL_MONTHS_THRESHOLD = 13
 MAX_WORKERS = 4 if os.getenv("ENV") == "production" else 12
@@ -293,6 +296,7 @@ def _consume_results(
             break
         if item is None:
             errors += 1
+            logger.warning("Falha ao baixar/parsear um período (item None)")
             continue
 
         year, month, records = item
@@ -303,6 +307,10 @@ def _consume_results(
             total_records += rec_count
             total_contracheques += cc_count
             synced_periods += 1
+            logger.info(
+                "Período %d/%02d salvo (%d/%d): %d registros, %d contracheques",
+                year, month, synced_periods, total_to_process, rec_count, cc_count,
+            )
         except Exception:
             db.rollback()
             func_cache.clear()
@@ -310,21 +318,28 @@ def _consume_results(
             cargo_cache.clear()
             cargo_cache.update(_preload_cargo_cache(db))
             errors += 1
+            logger.exception("Erro ao salvar período %d/%02d", year, month)
 
     return total_records, total_contracheques, synced_periods, errors
 
 
 def sync_all(db: Session) -> dict:
     inicio = datetime.now(timezone.utc)
+    logger.info("Sync iniciado")
 
     existing = _get_existing_months(db)
     all_periods = _discover_available_periods()
     current_year = datetime.now(timezone.utc).year
 
     to_fetch = _classify_periods(all_periods, existing, current_year)
+    logger.info(
+        "Descoberta concluída: %d períodos disponíveis, %d já no banco, %d para sincronizar",
+        len(all_periods), len(existing), len(to_fetch),
+    )
 
     if not to_fetch:
         _create_sync_log(db, inicio, sucesso=True, periodos_sincronizados=0, contracheques_novos=0)
+        logger.info("Sync concluído: já atualizado, nada a fazer")
         return {"status": "up_to_date", "total_periods": len(all_periods), "synced": 0}
 
     func_cache = _preload_func_cache(db)
@@ -339,12 +354,20 @@ def sync_all(db: Session) -> dict:
 
     producer.join()
 
+    sucesso = errors == 0
     _create_sync_log(
         db,
         inicio,
-        sucesso=errors == 0,
+        sucesso=sucesso,
         periodos_sincronizados=synced_periods,
         contracheques_novos=total_contracheques,
+    )
+
+    duracao = (datetime.now(timezone.utc) - inicio).total_seconds()
+    logger.info(
+        "Sync concluído (%s) em %.1fs: %d períodos, %d contracheques novos, %d erros",
+        "sucesso" if sucesso else "com erros",
+        duracao, synced_periods, total_contracheques, errors,
     )
 
     return {
