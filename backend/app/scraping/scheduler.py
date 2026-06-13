@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select, func
@@ -10,7 +11,7 @@ from app.scraping.service import sync_all
 
 logger = logging.getLogger(__name__)
 
-SYNC_INTERVAL_HOURS = 24
+SYNC_INTERVAL_HOURS = 8
 
 
 def _needs_sync() -> bool:
@@ -41,6 +42,15 @@ def _run_sync():
         logger.error("Erro no sync automático: %s", e)
 
 
+def _sync_loop():
+    while True:
+        try:
+            _run_sync()
+        except Exception:  # noqa: BLE001 - o loop nunca pode morrer
+            logger.exception("Erro inesperado no loop de sync automático")
+        time.sleep(SYNC_INTERVAL_HOURS * 3600)
+
+
 def start_auto_sync():
-    thread = threading.Thread(target=_run_sync, daemon=True)
+    thread = threading.Thread(target=_sync_loop, daemon=True)
     thread.start()
